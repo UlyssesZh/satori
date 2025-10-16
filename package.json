@@ -29,8 +29,10 @@
   "license": "MIT",
   "devDependencies": {
     "@cordisjs/eslint-config": "^1.1.1",
+    "@cordisjs/plugin-server": "^0.2.9",
     "@types/node": "^25.0.9",
     "c8": "^7.14.0",
+    "cordis": "^3.18.1",
     "esbuild": "^0.27.2",
     "esbuild-register": "^3.6.0",
     "eslint": "^8.57.0",
@@ -43,5 +45,10 @@
   },
   "resolutions": {
     "@types/koa__router/@types/koa": "^2"
+  },
+  "overrides": {
+    "@types/koa__router": {
+      "@types/koa": "^2"
+    }
   }
 }
