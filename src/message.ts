@@ -1,0 +1,589 @@
+import * as QQ from './types'
+import { Context, Dict, h, MessageEncoder } from '@satorijs/core'
+import { QQBot } from './bot'
+import { QQGuildBot } from './bot/guild'
+import { cacheMessage, getQuoteReference } from './message-cache'
+import crypto from 'crypto'
+
+export const escapeMarkdown = (val: string) =>
+  val
+    .replace(/([\\`*_[\*_~`\]\-(#!>])/g, '\\$&')
+
+export class QQGuildMessageEncoder<C extends Context = Context> extends MessageEncoder<C, QQGuildBot<C>> {
+  private content: string = ''
+  private file: Blob
+  private filename: string
+  fileUrl: string
+  private passiveId: string
+  private passiveEventId: string
+  reference: string
+  private retry = false
+  // 先文后图
+  async flush() {
+    if (!this.content.trim().length && !this.file && !this.fileUrl) {
+      return
+    }
+    const isDirect = this.channelId.includes('_')
+
+    let endpoint = `/channels/${this.channelId}/messages`
+    if (isDirect) endpoint = `/dms/${this.channelId.split('_')[0]}/messages`
+    const useFormData = Boolean(this.file)
+    let msg_id = this.options?.session?.messageId
+    if (this.options?.session && (Date.now() - this.options?.session?.timestamp) > MSG_TIMEOUT) {
+      msg_id = null
+    }
+    if (this.passiveId) msg_id = this.passiveId
+
+    let r: Partial<QQ.Message.Response>
+    this.bot.logger.debug('use form data %s', useFormData)
+    try {
+      if (useFormData) {
+        const form = new FormData()
+        form.append('content', this.content)
+        if (this.options?.session && msg_id) {
+          form.append('msg_id', msg_id)
+        }
+        if (this.passiveEventId) {
+          form.append('event_id', this.passiveEventId)
+        }
+        if (this.file) {
+          form.append('file_image', this.file, this.filename)
+        }
+        // if (this.fileUrl) {
+        //   form.append('image', this.fileUrl)
+        // }
+        r = await this.bot.http.post<QQ.Message>(endpoint, form)
+      } else {
+        const payload: QQ.Message.ChannelRequest = {
+          ...{
+            content: this.content,
+            msg_id,
+            image: this.fileUrl,
+          },
+          ...(this.reference ? {
+            message_reference: {
+              message_id: this.reference,
+            },
+          } : {}),
+          ...(this.passiveEventId ? {
+            event_id: this.passiveEventId,
+          } : {}),
+        }
+        if (isDirect) r = await this.bot.internal.sendDM(this.channelId.split('_')[0], payload)
+        else r = await this.bot.internal.sendMessage(this.channelId, payload)
+      }
+    } catch (e) {
+      if (this.bot.http.isError(e)) {
+        if (this.bot.parent.config.retryWhen.includes(e.response.data.code) && !this.retry && this.fileUrl) {
+          this.bot.logger.warn('retry image sending')
+          this.retry = true
+          await this.resolveFile(null, true)
+          await this.flush()
+        }
+        if (useFormData) {
+          this.bot.logger.warn(`POST ${endpoint} response: %o, trace id: %s`, e.response.data, e.response.headers.get('x-tps-trace-id'))
+        }
+      }
+    }
+
+    // this.bot.logger.debug(r)
+    const session = this.bot.session()
+    session.type = 'send'
+    // await decodeMessage(this.bot, r, session.event.message = {}, session.event)
+    session.guildId = this.session.guildId
+    session.channelId = this.channelId
+    session.isDirect = isDirect
+
+    // https://bot.q.qq.com/wiki/develop/api/gateway/direct_message.html#%E6%B3%A8%E6%84%8F
+    /**
+     * active msg, http 202: {"code":304023,"message":"push message is waiting for audit now","data":{"message_audit":{"audit_id":"xxx"}}}
+     * passive msg, http 200: Partial<QQ.Message>
+     */
+    if (r?.id) {
+      session.messageId = r.id
+      session.app.emit(session, 'send', session)
+      this.results.push(session.event.message)
+    } else if (r?.code === 304023 && this.bot.config.parent.intents & QQ.Intents.MESSAGE_AUDIT) {
+      try {
+        const auditData: QQ.MessageAudited = await this.audit(r.data.message_audit.audit_id)
+        session.messageId = auditData.message_id
+        session.app.emit(session, 'send', session)
+        this.results.push(session.event.message)
+      } catch (e) {
+        this.bot.logger.error(e)
+      }
+    }
+    this.content = ''
+    this.file = null
+    this.filename = null
+    this.fileUrl = null
+    this.retry = false
+  }
+
+  async audit(audit_id: string): Promise<QQ.MessageAudited> {
+    return new Promise((resolve, reject) => {
+      const dispose = this.bot.ctx.on('qq/message-audit-pass', (data) => {
+        if (data.audit_id === audit_id) {
+          dispose()
+          dispose2()
+          resolve(data)
+        }
+      })
+      const dispose2 = this.bot.ctx.on('qq/message-audit-reject', (data) => {
+        if (data.audit_id === audit_id) {
+          dispose()
+          dispose2()
+          reject(data)
+        }
+      })
+    })
+  }
+
+  async resolveFile(attrs: Dict, download = false) {
+    if (!download && !await this.bot.ctx.http.isLocal(attrs.src || attrs.url)) {
+      return this.fileUrl = attrs.src || attrs.url
+    }
+    const { data, filename, type } = await this.bot.ctx.http.file(this.fileUrl || attrs.src || attrs.url, attrs)
+    this.file = new Blob([data], { type })
+    this.filename = filename
+    this.fileUrl = null
+  }
+
+  async visit(element: h) {
+    const { type, attrs, children } = element
+    if (type === 'text') {
+      this.content += attrs.content
+    } else if (type === 'at') {
+      switch (attrs.type) {
+        case 'all':
+          this.content += `@everyone`
+          break
+        default:
+          this.content += `<@${attrs.id}>`
+      }
+    } else if (type === 'br') {
+      this.content += '\n'
+    } else if (type === 'p') {
+      if (!this.content.endsWith('\n')) this.content += '\n'
+      await this.render(children)
+      if (!this.content.endsWith('\n')) this.content += '\n'
+    } else if (type === 'sharp') {
+      this.content += `<#${attrs.id}>`
+    } else if (type === 'quote') {
+      this.reference = attrs.id
+      await this.flush()
+    } else if (type === 'passive') {
+      if (attrs.messageId) this.passiveId = attrs.messageId
+      if (attrs.eventId) this.passiveEventId = attrs.eventId
+    } else if ((type === 'img' || type === 'image') && (attrs.src || attrs.url)) {
+      await this.flush()
+      await this.resolveFile(attrs)
+      await this.flush()
+    } else if (type === 'message') {
+      await this.flush()
+      await this.render(children)
+      await this.flush()
+    } else {
+      await this.render(children)
+    }
+  }
+}
+
+const MSG_TIMEOUT = 5 * 60 * 1000 - 2000 // 5 mins
+const REMOTE_FILE_ERRORS = new Set([40093007, 850027, 40034003])
+
+export class QQMessageEncoder<C extends Context = Context> extends MessageEncoder<C, QQBot<C>> {
+  private content: string = ''
+  private passiveId: string
+  private passiveSeq: number
+  private passiveEventId: string
+  private useMarkdown = false
+  private inMarkdown = 0
+  private rows: QQ.Button[][] = []
+  private attachedFile: QQ.Message.File.Response
+  private retry = false
+  reference: string
+
+  // 先图后文
+  async flush() {
+    if (!this.content.trim() && !this.rows.flat().length && !this.attachedFile) {
+      this.reset() // eg: <><qq:markdown></qq:markdown><image ...></>
+      return
+    }
+    this.trimButtons()
+    let msg_id: string, msg_seq: number, event_id: string
+    if (this.options?.session?.messageId && Date.now() - this.options.session.timestamp < MSG_TIMEOUT) {
+      this.options.session['seq'] ||= 0
+      msg_id = this.options.session.messageId
+      msg_seq = ++this.options.session['seq']
+    } else if (this.options?.session?.qq?.['id'] && Date.now() - this.options.session.timestamp < MSG_TIMEOUT) {
+      event_id = this.options.session.qq['id']
+    }
+    if (this.passiveId) msg_id = this.passiveId
+    if (this.passiveSeq) msg_seq = this.passiveSeq
+    if (this.passiveEventId) event_id = this.passiveEventId
+    const data: QQ.Message.Request = {
+      content: this.content,
+      msg_type: QQ.Message.Type.TEXT,
+      msg_id,
+      msg_seq,
+      event_id,
+    }
+    if (this.reference) {
+      data.message_reference = {
+        message_id: getQuoteReference(this.bot, this.session.channelId, this.session.isDirect, this.reference),
+      }
+    }
+    if (this.attachedFile) {
+      data.media = this.attachedFile
+      data.msg_type = QQ.Message.Type.MEDIA
+    }
+    if (this.useMarkdown) {
+      data.msg_type = QQ.Message.Type.MARKDOWN
+      delete data.content
+      data.markdown = {
+        content: this.content,
+      }
+      if (this.bot.config.markdownVerifyImage) {
+        data.markdown.force_verify_image_resource = true
+      }
+      if (this.rows.length) {
+        data.markdown.content ||= ' '
+        data.keyboard = {
+          content: {
+            rows: this.exportButtons(),
+          },
+        }
+      }
+    }
+    const session = this.bot.session()
+    session.type = 'send'
+    const send = async () => {
+      try {
+        const resp = this.session.isDirect
+          ? await this.bot.internal.sendPrivateMessage(this.session.channelId, data)
+          : await this.bot.internal.sendMessage(this.session.channelId, data)
+        if (resp.id && !resp.audit_id) {
+          session.messageId = resp.id
+          session.timestamp = new Date(resp.timestamp).valueOf()
+          session.channelId = this.session.channelId
+          session.guildId = this.session.guildId
+          cacheMessage(this.bot, this.session.channelId, this.session.isDirect, {
+            id: resp.id,
+            user: this.bot.user,
+          }, resp.ext_info?.ref_idx)
+          session.app.emit(session, 'send', session)
+          this.results.push(session.event.message)
+        } else if (resp.audit_id && this.bot.config.intents & QQ.Intents.MESSAGE_AUDIT) {
+          try {
+            const auditData: QQ.MessageAudited = await this.audit(resp.audit_id)
+            session.messageId = auditData.message_id
+            session.app.emit(session, 'send', session)
+            this.results.push(session.event.message)
+          } catch (e) {
+            this.bot.logger.error(e)
+          }
+        }
+      } catch (e) {
+        if (!this.bot.http.isError(e)) throw e
+        this.errors.push(e)
+        if (!this.retry && this.bot.config.retryWhen.includes(e.response.data.code)) {
+          this.bot.logger.warn('%s retry message sending', this.session.cid)
+          this.retry = true
+          await send()
+        }
+      }
+    }
+    await send()
+    this.reset()
+  }
+
+  private reset() {
+    this.content = ''
+    this.useMarkdown = false
+    this.attachedFile = null
+    this.rows = []
+    this.retry = false
+  }
+
+  async audit(audit_id: string): Promise<QQ.MessageAudited> {
+    return new Promise((resolve, reject) => {
+      const dispose = this.bot.ctx.on('qq/message-audit-pass', (data) => {
+        if (data.audit_id === audit_id) {
+          dispose()
+          dispose2()
+          resolve(data)
+        }
+      })
+      const dispose2 = this.bot.ctx.on('qq/message-audit-reject', (data) => {
+        if (data.audit_id === audit_id) {
+          dispose()
+          dispose2()
+          reject(data)
+        }
+      })
+    })
+  }
+
+  async sendFile(type: string, attrs: Dict, download = false) {
+    const url = attrs.src || attrs.url
+    let file_type = 0
+    if (type === 'img' || type === 'image') file_type = 1
+    else if (type === 'video') file_type = 2
+    else if (type === 'audio') file_type = 3
+    else if (type === 'file') file_type = 4
+    else return
+    const data: QQ.Message.File.Request = {
+      file_type,
+      srv_send_msg: false,
+      file_name: attrs.title || attrs.filename || attrs.file,
+    }
+    let fileData: Buffer | undefined
+    let fileDataBase64: string | undefined
+    let fileSize = 0
+    // https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types/Common_types
+    const capture = /^data:([\w/.+-]+);base64,(.*)$/.exec(url)
+    if (capture?.[2]) {
+      fileDataBase64 = capture[2]
+      fileSize = Buffer.byteLength(fileDataBase64, 'base64')
+    } else if (download || await this.bot.ctx.http.isLocal(url)) {
+      const file = await this.bot.ctx.http.file(url)
+      data.file_name ||= file.filename
+      fileData = Buffer.from(file.data)
+      fileSize = fileData.length
+    } else {
+      data.url = url
+    }
+    let res: QQ.Message.File.Response
+    try {
+      if (fileSize > this.bot.config.uploadThreshold) {
+        res = await this.chunkedUpload(file_type, data.file_name ?? 'unnamed', fileData ?? Buffer.from(fileDataBase64!, 'base64'))
+      } else {
+        if (fileData || fileDataBase64) {
+          data.file_data = fileDataBase64 ?? fileData.toString('base64')
+        }
+        if (this.session.isDirect) {
+          res = await this.bot.internal.sendFilePrivate(this.session.channelId, data)
+        } else {
+          res = await this.bot.internal.sendFileGuild(this.session.channelId, data)
+        }
+      }
+    } catch (e) {
+      if (!this.bot.http.isError(e)) throw e
+      // QQ cannot always fetch third-party CDNs (for example Discord). Upload
+      // the bytes ourselves once instead of sending the same inaccessible URL.
+      if (data.url && (REMOTE_FILE_ERRORS.has(e.response?.data?.code) || REMOTE_FILE_ERRORS.has(e.response?.data?.err_code))) {
+        return this.sendFile(type, attrs, true)
+      }
+      if (!this.retry && this.bot.config.retryWhen.includes(e.response.data.code)) {
+        this.bot.logger.warn('%s retry message sending', this.session.cid)
+        this.retry = true
+        return this.sendFile(type, attrs, download)
+      }
+      this.errors.push(e)
+    }
+    this.retry = false
+    return res
+  }
+
+  async chunkedUpload(
+    fileType: QQ.Message.File.Type,
+    fileName: string,
+    fileData: Uint8Array,
+    send?: boolean,
+  ) {
+    const md5 = crypto.createHash('md5').update(fileData).digest('hex')
+    const sha1 = crypto.createHash('sha1').update(fileData).digest('hex')
+    // QQ defines this prefix as 10,002,432 bytes, rather than 10 MiB.
+    const md5_10m = crypto.createHash('md5').update(fileData.subarray(0, 10_002_432)).digest('hex')
+    let uploadInfo: QQ.Message.File.UploadPrepareResponse
+    if (this.session.isDirect) {
+      uploadInfo = await this.bot.internal.uploadPreparePrivate(this.session.channelId, {
+        file_type: fileType, file_size: fileData.length, file_name: fileName, md5, sha1, md5_10m,
+      })
+    } else {
+      uploadInfo = await this.bot.internal.uploadPrepareGuild(this.session.channelId, {
+        file_type: fileType, file_size: fileData.length, file_name: fileName, md5, sha1, md5_10m,
+      })
+    }
+    const blockSize = +uploadInfo.block_size
+    for (const part of uploadInfo.parts) {
+      const offset = (part.index - 1) * blockSize
+      const length = +part.block_size > 0 ? +part.block_size : blockSize
+      const buffer = fileData.subarray(offset, offset + length)
+      await this.bot.ctx.http.put(part.presigned_url, buffer)
+      const data: QQ.Message.File.UploadPartFinishRequest = {
+        upload_id: uploadInfo.upload_id,
+        part_index: part.index,
+        block_size: buffer.length,
+        md5: crypto.createHash('md5').update(buffer).digest('hex'),
+      }
+      if (this.session.isDirect) {
+        await this.bot.internal.uploadPartFinishPrivate(this.session.channelId, data)
+      } else {
+        await this.bot.internal.uploadPartFinishGuild(this.session.channelId, data)
+      }
+    }
+    if (this.session.isDirect) {
+      return this.bot.internal.sendFilePrivate(this.session.channelId, {
+        upload_id: uploadInfo.upload_id,
+        srv_send_msg: !!send,
+      })
+    } else {
+      return this.bot.internal.sendFileGuild(this.session.channelId, {
+        upload_id: uploadInfo.upload_id,
+        srv_send_msg: !!send,
+      })
+    }
+  }
+
+  decodeButton(attrs: Dict, label: string) {
+    const result: QQ.Button = {
+      id: attrs.id,
+      render_data: {
+        label,
+        visited_label: label,
+        style: attrs.class === 'primary' ? 1 : 0,
+      },
+      action: {
+        type: attrs.type === 'input' ? 2
+          : (attrs.type === 'link' ? 0 : 1),
+        permission: {
+          type: 2,
+        },
+        data: attrs.type === 'input'
+          ? attrs.text : attrs.type === 'link'
+            ? attrs.href : attrs.id,
+      },
+    }
+    return result
+  }
+
+  lastRow() {
+    if (!this.rows.length) this.rows.push([])
+    let last = this.rows[this.rows.length - 1]
+    if (last.length >= 5) {
+      this.rows.push([])
+      last = this.rows[this.rows.length - 1]
+    }
+    return last
+  }
+
+  trimButtons() {
+    if (this.rows.length && this.rows[this.rows.length - 1].length === 0) this.rows.pop()
+  }
+
+  exportButtons() {
+    return this.rows.map(v => ({
+      buttons: v,
+    })) as QQ.InlineKeyboardRow[]
+  }
+
+  async ensureMarkdown() {
+    if (this.attachedFile) {
+      this.useMarkdown = false
+      await this.flush()
+    }
+    if (!this.useMarkdown) {
+      this.content = escapeMarkdown(this.content)
+      this.useMarkdown = true
+    }
+  }
+
+  async visit(element: h) {
+    const { type, attrs, children } = element
+    if (type === 'text') {
+      this.content += this.useMarkdown && !this.inMarkdown
+        ? escapeMarkdown(attrs.content) : attrs.content
+    } else if (type === 'passive') {
+      if (attrs.messageId) this.passiveId = attrs.messageId
+      if (attrs.seq) this.passiveSeq = Number(attrs.seq)
+      if (attrs.eventId) this.passiveEventId = attrs.eventId
+    } else if (type === 'quote') {
+      this.reference = attrs.id
+      await this.flush()
+    } else if ((type === 'img' || type === 'image') && (attrs.src || attrs.url)) {
+      await this.flush()
+      const data = await this.sendFile(type, attrs)
+      if (data) this.attachedFile = data
+    } else if (type === 'video' && (attrs.src || attrs.url)) {
+      await this.flush()
+      const data = await this.sendFile(type, attrs)
+      if (data) this.attachedFile = data
+      await this.flush() // text can't send with video
+    } else if (type === 'file' && (attrs.src || attrs.url)) {
+      await this.flush()
+      const data = await this.sendFile(type, attrs)
+      if (data) this.attachedFile = data
+      await this.flush()
+    } else if (type === 'audio' && (attrs.src || attrs.url)) {
+      await this.flush()
+      const { data } = await this.bot.ctx.http.file(attrs.src || attrs.url, attrs)
+      if (new TextDecoder().decode(data.slice(0, 7)).includes('#!SILK')) {
+        const onlineFile = await this.sendFile(type, {
+          src: `data:audio/amr;base64,` + Buffer.from(data).toString('base64'),
+        })
+        this.attachedFile = onlineFile
+      } else {
+        const ntsilk = this.bot.ctx.get('ntsilk')
+        if (ntsilk) {
+          const result = await ntsilk.encode(data)
+          const onlineFile = await this.sendFile(type, {
+            src: `data:audio/amr;base64,` + result.output.toString('base64'),
+          })
+          if (onlineFile) this.attachedFile = onlineFile
+        } else {
+          const silk = this.bot.ctx.get('silk')
+          if (!silk) return this.bot.logger.warn('missing ntsilk/silk service, cannot send non-silk audio')
+          const allowSampleRate = [8000, 12000, 16000, 24000, 32000, 44100, 48000]
+          if (silk.isWav(data) && allowSampleRate.includes(silk.getWavFileInfo(data).fmt.sampleRate)) {
+            const result = await silk.encode(data, 0)
+            const onlineFile = await this.sendFile(type, {
+              src: `data:audio/amr;base64,` + Buffer.from(result.data).toString('base64'),
+            })
+            if (onlineFile) this.attachedFile = onlineFile
+          } else {
+            if (!this.bot.ctx.get('ffmpeg')) return this.bot.logger.warn('missing ffmpeg service, cannot send non-silk audio except some wav')
+            const pcmBuf = await this.bot.ctx.get('ffmpeg')
+              .builder()
+              .input(Buffer.from(data))
+              .outputOption('-ar', '24000', '-ac', '1', '-f', 's16le')
+              .run('buffer')
+            const result = await silk.encode(pcmBuf, 24000)
+            const onlineFile = await this.sendFile(type, {
+              src: `data:audio/amr;base64,` + Buffer.from(result.data).toString('base64'),
+            })
+            if (onlineFile) this.attachedFile = onlineFile
+          }
+        }
+      }
+      await this.flush()
+    } else if (type === 'br') {
+      this.content += '\n'
+    } else if (type === 'p') {
+      if (!this.content.endsWith('\n')) this.content += '\n'
+      await this.render(children)
+      if (!this.content.endsWith('\n')) this.content += '\n'
+    } else if (type === 'qq:markdown') {
+      await this.ensureMarkdown()
+      this.inMarkdown++
+      await this.render(children)
+      this.inMarkdown--
+    } else if (type === 'button-group') {
+      await this.ensureMarkdown()
+      this.rows.push([])
+      await this.render(children)
+      this.rows.push([])
+    } else if (type === 'button') {
+      await this.ensureMarkdown()
+      const last = this.lastRow()
+      last.push(this.decodeButton(attrs, children.join('')))
+    } else if (type === 'message') {
+      await this.flush()
+      await this.render(children)
+      await this.flush()
+    } else {
+      await this.render(children)
+    }
+  }
+}
